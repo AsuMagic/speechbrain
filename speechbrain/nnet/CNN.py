@@ -1124,6 +1124,7 @@ class DepthwiseSeparableConv2d(nn.Module):
         dilation=(1, 1),
         padding="same",
         bias=True,
+        conv_init=None,
     ):
         super().__init__()
 
@@ -1149,12 +1150,14 @@ class DepthwiseSeparableConv2d(nn.Module):
             padding=padding,
             groups=chn2,
             bias=bias,
+            conv_init=conv_init,
         )
 
         self.pointwise = Conv2d(
             out_channels,
             kernel_size=(1, 1),
             input_shape=input_shape,
+            conv_init=conv_init,
         )
 
     def forward(self, x):

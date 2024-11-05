@@ -10,6 +10,7 @@ from typing import Iterable, Optional
 
 import torch
 
+import speechbrain as sb
 from speechbrain.lobes.models.huggingface_transformers import TextEncoder
 from speechbrain.utils.distances import cosine_similarity_matrix
 from speechbrain.utils.logger import get_logger
@@ -104,6 +105,9 @@ class BERTScoreStats(MetricStats):
         target: list
             the ground truths in tokenizable format
         """
+        ids = sb.utils.distributed_metrics.gather_for_metrics(ids)
+        predict = sb.utils.distributed_metrics.gather_for_metrics(predict)
+        target = sb.utils.distributed_metrics.gather_for_metrics(target)
         self.ids.extend(ids)
         self.predictions.extend(predict)
         self.targets.extend(target)
