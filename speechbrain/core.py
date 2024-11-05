@@ -44,7 +44,12 @@ from speechbrain.dataio.sampler import (
 from speechbrain.utils.distributed import is_distributed_initialized
 from speechbrain.utils.logger import get_logger
 from speechbrain.utils.optimizers import rm_vector_weight_decay
-from speechbrain.utils.profiling import prepare_profiler
+from speechbrain.dataio.dataloader import LoopedLoader
+from speechbrain.dataio.dataloader import SaveableDataLoader
+from speechbrain.dataio.sampler import DistributedSamplerWrapper
+from speechbrain.dataio.sampler import ReproducibleRandomSampler
+from speechbrain.utils.profiling import prepare_profiler, ProfiledIterable
+from dataclasses import dataclass
 
 sb.utils.quirks.apply_quirks()
 
@@ -54,6 +59,8 @@ DEFAULT_LOG_CONFIG = os.path.join(DEFAULT_LOG_CONFIG, "log-config.yaml")
 INTRA_EPOCH_CKPT_FLAG = "brain_intra_epoch_ckpt"
 PYTHON_VERSION_MAJOR = 3
 PYTHON_VERSION_MINOR = 8
+
+sb.utils.quirks.apply_quirks()
 
 # Arguments passed via the run opts dictionary
 run_opt_defaults = {
@@ -859,10 +866,64 @@ class Brain:
         """Prints the number of trainable parameters in the model."""
         total_trainable_params = 0
         total_parameters = 0
-        for parameter in self.modules.parameters():
+
+        logger.info("Dumping model parameters...")
+
+        for name, parameter in self.modules.named_parameters():
             total_parameters += parameter.numel()
             if parameter.requires_grad:
                 total_trainable_params += parameter.numel()
+
+            logger.info(
+                f"* {'GRAD' if parameter.requires_grad else '----'} "
+                f"shape={str(tuple(parameter.shape)):>20} "
+                f"mean={parameter.sum() / parameter.numel():8.4f} "
+                f"std={parameter.std():8.4f} "
+                f"min/max={parameter.abs().max():8.4f} "
+                f"dtype={str(parameter.dtype):<15} "
+                f"{(parameter.numel() * parameter.element_size()) / 1024:>9.1f}KiB "
+                f"{parameter.numel():>9}: "
+                f"{name}"
+            )
+
+        warned_ptrs = set()
+
+        for key, value in self.hparams.__dict__.items():
+            if isinstance(value, torch.nn.Module):
+                for module_name, module_param in value.named_parameters():
+                    if (
+                        module_param.data.data_ptr() not in warned_ptrs
+                        and not any(module_param.data.data_ptr() == known_param.data.data_ptr() for known_param in self.modules.parameters())
+                    ):
+                        logger.warning(f"* Trainable parameter found through hparams but not in `modules`: `hparams.{key}.{module_name}` (forgotten? false positive?)")
+                        warned_ptrs.add(module_param.data.data_ptr())
+
+        tested_checkpoint_key_count = 0
+        if hasattr(self.hparams, "checkpointer"):
+            ckpt_params = {}
+
+            for recoverable_name, recoverable in self.hparams.checkpointer.recoverables.items():
+                if isinstance(recoverable, torch.nn.Module):
+                    recoverable_params = {f"{recoverable_name}.{name}": param for name, param in recoverable.named_parameters()}
+                    ckpt_params.update(recoverable_params)
+
+            for name, param in self.modules.named_parameters():
+                if param.requires_grad:
+                    tested_checkpoint_key_count += 1
+                    found_match = False
+                    for ckpt_name, ckpt_param in ckpt_params.items():
+                        if param.data.data_ptr() == ckpt_param.data.data_ptr():
+                            found_match = True
+                            match_name = ckpt_name
+
+                    if not found_match:
+                        logger.warning(f"* Trainable parameter found in `modules` not in any `torch.nn.Module` of `checkpointer.recoverables`: `{name}` (maybe never saved? maybe saved not through the Module?)")
+                    else:
+                        logger.debug(f"* Match: {name} <-> {match_name}")
+
+        if tested_checkpoint_key_count == 0:
+            logger.warning(f"No checkpointer found; couldn't sanity check recoverables")
+
         class_name = self.__class__.__name__
         if total_parameters == 0:
             logger.warning("The model has no parameters!")
@@ -1024,12 +1085,10 @@ class Brain:
         # TRAIN stage is handled specially.
         if stage == sb.Stage.TRAIN:
             loader_kwargs = self._train_loader_specifics(dataset, loader_kwargs)
-        # This commented-out code block is useful when one can ensure
-        # metric reporting is DDP-valid for VALID & EVAL datasets.
-        # elif self.distributed_launch:
-        #     loader_kwargs = sb.dataio.dataloader.distributed_loader_specifics(
-        #         self.distributed_launch, self.rank, dataset, loader_kwargs
-        #     )
+        elif self.distributed_launch:
+            loader_kwargs = sb.dataio.dataloader.distributed_loader_specifics(
+                self.distributed_launch, self.rank, dataset, loader_kwargs
+            )
         dataloader = sb.dataio.dataloader.make_dataloader(
             dataset, **loader_kwargs
         )
@@ -1411,7 +1470,7 @@ class Brain:
             loss = self.compute_objectives(out, batch, stage=stage)
         return loss.detach().cpu()
 
-    def _fit_train(self, train_set, epoch, enable):
+    def _fit_train(self, train_set, epoch, enable_progressbar):
         # Training stage
         self.on_stage_start(Stage.TRAIN, epoch)
         self.modules.train()
@@ -1429,10 +1488,10 @@ class Brain:
         last_ckpt_time = time.time()
         steps_since_ckpt = 0
         with tqdm(
-            train_set,
+            ProfiledIterable(train_set),
             initial=self.step,
             dynamic_ncols=True,
-            disable=not enable,
+            disable=not enable_progressbar,
             colour=self.tqdm_barcolor["train"],
         ) as t:
             if self.profiler is not None:
@@ -1471,7 +1530,12 @@ class Brain:
                     steps_since_ckpt = 0
 
         # Run train "on_stage_end" on all processes
-        self.zero_grad(set_to_none=True)  # flush gradients
+        # flush gradients
+        self.zero_grad(set_to_none=True)
+        # sync the avg_loss across all processes
+        self.avg_train_loss = sb.utils.distributed.reduce(
+            torch.tensor(self.avg_train_loss, device=self.device)
+        ).item()
         self.on_stage_end(Stage.TRAIN, self.avg_train_loss, epoch)
         self.avg_train_loss = 0.0
         self.step = 0
@@ -1507,7 +1571,7 @@ class Brain:
             torch.distributed.broadcast_object_list(broadcast_list, src=0)
             return broadcast_list[0]
 
-    def _fit_valid(self, valid_set, epoch, enable):
+    def _fit_valid(self, valid_set, epoch, enable_progressbar):
         # Validation stage
         if valid_set is not None:
             self.on_stage_start(Stage.VALID, epoch)
@@ -1517,7 +1581,7 @@ class Brain:
                 for batch in tqdm(
                     valid_set,
                     dynamic_ncols=True,
-                    disable=not enable,
+                    disable=not enable_progressbar,
                     colour=self.tqdm_barcolor["valid"],
                 ):
                     self.step += 1
@@ -1529,6 +1593,10 @@ class Brain:
                         break
 
                 self.step = 0
+                # sync the avg_loss across all processes
+                avg_valid_loss = sb.utils.distributed.reduce(
+                    torch.tensor(avg_valid_loss, device=self.device)
+                ).item()
                 self.on_stage_end(Stage.VALID, avg_valid_loss, epoch)
 
     def fit(
@@ -1614,12 +1682,22 @@ class Brain:
             progressbar = not self.noprogressbar
 
         # Only show progressbar if requested and main_process
-        enable = progressbar and sb.utils.distributed.if_main_process()
+        enable_progressbar = (
+            progressbar and sb.utils.distributed.if_main_process()
+        )
 
         # Iterate epochs
         for epoch in epoch_counter:
-            self._fit_train(train_set=train_set, epoch=epoch, enable=enable)
-            self._fit_valid(valid_set=valid_set, epoch=epoch, enable=enable)
+            self._fit_train(
+                train_set=train_set,
+                epoch=epoch,
+                enable_progressbar=enable_progressbar,
+            )
+            self._fit_valid(
+                valid_set=valid_set,
+                epoch=epoch,
+                enable_progressbar=enable_progressbar,
+            )
 
             # Debug mode only runs a few epochs
             if (
@@ -1776,7 +1854,9 @@ class Brain:
             progressbar = not self.noprogressbar
 
         # Only show progressbar if requested and main_process
-        enable = progressbar and sb.utils.distributed.if_main_process()
+        enable_progressbar = (
+            progressbar and sb.utils.distributed.if_main_process()
+        )
 
         if not (
             isinstance(test_set, DataLoader)
@@ -1794,7 +1874,7 @@ class Brain:
             for batch in tqdm(
                 test_set,
                 dynamic_ncols=True,
-                disable=not enable,
+                disable=not enable_progressbar,
                 colour=self.tqdm_barcolor["test"],
             ):
                 self.step += 1
@@ -1805,6 +1885,10 @@ class Brain:
                 if self.debug and self.step == self.debug_batches:
                     break
 
+            # sync the avg_loss across all processes
+            avg_test_loss = sb.utils.distributed.reduce(
+                torch.tensor(avg_test_loss, device=self.device)
+            ).item()
             self.on_stage_end(Stage.TEST, avg_test_loss, None)
         self.step = 0
         return avg_test_loss

@@ -15,6 +15,11 @@ Note: Before running this recipe, make sure numba is installed. Otherwise, run:
 pip install numba
 ```
 
+If you are planning to use FastRNNT loss function, install `FastRNNT`:
+```
+pip install FastRNNT
+```
+
 # How to run it
 ```shell
 python train.py hparams/conformer_transducer.yaml

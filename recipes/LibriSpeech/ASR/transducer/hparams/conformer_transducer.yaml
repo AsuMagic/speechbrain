@@ -46,11 +46,12 @@ ckpt_interval_minutes: 5 # save checkpoint every N min
 # The global batch size is computed as batch_size * n_gpus * grad_accumulation_factor.
 # Empirically, we found that this value should be >= 128.
 # Please, set your parameters accordingly.
-number_of_epochs: 100
-warmup_steps: 25000
+number_of_epochs: 150
+warmup_steps: 3000
 num_workers: 4
 batch_size_valid: 4
 lr: 0.0008
+lr_final: 0.0001
 weight_decay: 0.01
 number_of_ctc_epochs: 60
 ctc_weight: 0.3 # Multitask with CTC for the encoder (0.0 = disabled)
@@ -62,7 +63,7 @@ precision: fp32 # bf16, fp16 or fp32
 # The batch size is used if and only if dynamic batching is set to False
 # Validation and testing are done with fixed batches and not dynamic batching.
 batch_size: 8
-grad_accumulation_factor: 4
+grad_accumulation_factor: 1
 sorting: random
 avg_checkpoints: 10 # Number of checkpoints to average for evaluation
 
@@ -82,11 +83,11 @@ streaming: True  # controls all Dynamic Chunk Training & chunk size & left conte
 # In this model, a chunk is roughly equivalent to 40ms of audio.
 dynchunktrain_config_sampler: !new:speechbrain.utils.dynamic_chunk_training.DynChunkTrainConfigRandomSampler # yamllint disable-line rule:line-length
    chunkwise_prob: 0.6 # Probability during a batch to limit attention and sample a random chunk size in the following range
-   chunk_size_min: 8 # Minimum chunk size (if in a DynChunkTrain batch)
-   chunk_size_max: 32 # Maximum chunk size (if in a DynChunkTrain batch)
+   chunk_size_min: 4 # Minimum chunk size (if in a DynChunkTrain batch)
+   chunk_size_max: 16 # Maximum chunk size (if in a DynChunkTrain batch)
    limited_left_context_prob: 0.75 # If in a DynChunkTrain batch, the probability during a batch to restrict left context to a random number of chunks
-   left_context_chunks_min: 2 # Minimum left context size (in # of chunks)
-   left_context_chunks_max: 32 # Maximum left context size (in # of chunks)
+   left_context_chunks_min: 1 # Minimum left context size (in # of chunks)
+   left_context_chunks_max: 16 # Maximum left context size (in # of chunks)
    # If you specify a valid/test config, you can optionally have evaluation be
    # done with a specific DynChunkTrain configuration.
    # valid_config: !new:speechbrain.utils.dynamic_chunk_training.DynChunkTrainConfig
@@ -98,18 +99,29 @@ dynchunktrain_config_sampler: !new:speechbrain.utils.dynamic_chunk_training.DynC
 train_dataloader_opts:
    batch_size: !ref <batch_size>
    num_workers: !ref <num_workers>
+   pin_memory: True
+   persistent_workers: True
+   prefetch_factor: 4
 
 valid_dataloader_opts:
    batch_size: !ref <batch_size_valid>
+   num_workers: !ref <num_workers>
+   pin_memory: True
+   persistent_workers: True
+   prefetch_factor: 4
 
 test_dataloader_opts:
    batch_size: !ref <batch_size_valid>
+   num_workers: !ref <num_workers>
+   pin_memory: True
+   persistent_workers: True
+   prefetch_factor: 4
 
 # This setup works well for 3090 24GB GPU, adapt it to your needs.
 # Adjust grad_accumulation_factor depending on the DDP node count (here 3)
 # Or turn it off (but training speed will decrease)
 dynamic_batching: True
-max_batch_len: 150
+max_batch_len: 500
 max_batch_len_val: 50 # we reduce it as the beam is much wider (VRAM)
 num_bucket: 200
 
@@ -134,7 +146,7 @@ transformer_dropout: 0.1
 activation: !name:torch.nn.GELU
 output_neurons: 1000
 dec_dim: 512
-dec_emb_dropout: 0.2
+dec_emb_dropout: 0.0  # FIXME: emb is one-hot, why did i even do this?
 dec_dropout: 0.1
 
 # Decoding parameters
@@ -149,9 +161,6 @@ nbest: 1
 state_beam: 2.3
 expand_beam: 2.3
 lm_weight: 0.50
-
-# If True uses torchaudio loss. Otherwise, the numba one
-use_torchaudio: False
 
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
    limit: !ref <number_of_epochs>
@@ -172,6 +181,7 @@ compute_features: !new:speechbrain.lobes.features.Fbank
 speed_perturb: !new:speechbrain.augment.time_domain.SpeedPerturb
    orig_freq: !ref <sample_rate>
    speeds: [95, 100, 105]
+   device: cuda
 
 # Augmenter: Combines previously defined augmentations to perform data augmentation
 wav_augment: !new:speechbrain.augment.augmenter.Augmenter
@@ -218,15 +228,21 @@ fea_augment: !new:speechbrain.augment.augmenter.Augmenter
 
 CNN: !new:speechbrain.lobes.models.convolution.ConvolutionFrontEnd
    input_shape: (8, 10, 80)
-   num_blocks: 2
+   num_blocks: 3
    num_layers_per_block: 1
-   out_channels: (64, 32)
-   kernel_sizes: (3, 3)
-   strides: (2, 2)
-   residuals: (False, False)
+   out_channels: (256, 256, 256)
+   kernel_sizes: (3, 3, 3)
+   strides: (2, 2, 2)
+   residuals: (False, False, False)
+   norm: null
+   dropout: 0.0
+   conv_modules:
+      - !name:speechbrain.nnet.CNN.Conv2d
+      - !name:speechbrain.nnet.CNN.DepthwiseSeparableConv2d
+      - !name:speechbrain.nnet.CNN.DepthwiseSeparableConv2d
 
 Transformer: !new:speechbrain.lobes.models.transformer.TransformerASR.TransformerASR # yamllint disable-line rule:line-length
-   input_size: 640
+   input_size: 2560
    tgt_vocab: !ref <output_neurons>
    d_model: !ref <d_model>
    nhead: !ref <nhead>
@@ -239,6 +255,7 @@ Transformer: !new:speechbrain.lobes.models.transformer.TransformerASR.Transforme
    attention_type: RelPosMHAXL
    normalize_before: True
    causal: False
+   kernel_size: 9
 
 # We must call an encoder wrapper so the decoder isn't run (we don't have any)
 enc: !new:speechbrain.lobes.models.transformer.TransformerASR.EncoderWrapper
@@ -246,19 +263,19 @@ enc: !new:speechbrain.lobes.models.transformer.TransformerASR.EncoderWrapper
 
 # For MTL CTC over the encoder
 proj_ctc: !new:speechbrain.nnet.linear.Linear
-   input_size: !ref <joint_dim>
+   input_size: !ref <output_neurons>
    n_neurons: !ref <output_neurons>
 
 # Define some projection layers to make sure that enc and dec
 # output dim are the same before joining
 proj_enc: !new:speechbrain.nnet.linear.Linear
    input_size: !ref <d_model>
-   n_neurons: !ref <joint_dim>
+   n_neurons: !ref <output_neurons>
    bias: False
 
 proj_dec: !new:speechbrain.nnet.linear.Linear
    input_size: !ref <dec_dim>
-   n_neurons: !ref <joint_dim>
+   n_neurons: !ref <output_neurons>
    bias: False
 
 # Uncomment for MTL with CTC
@@ -287,34 +304,35 @@ dec: !new:speechbrain.nnet.RNN.LSTM
 ce_cost: !name:speechbrain.nnet.losses.nll_loss
    label_smoothing: 0.1
 
-Tjoint: !new:speechbrain.nnet.transducer.transducer_joint.Transducer_joint
-   joint: sum # joint [sum | concat]
-   nonlinearity: !ref <activation>
-
-transducer_lin: !new:speechbrain.nnet.linear.Linear
-   input_size: !ref <joint_dim>
-   n_neurons: !ref <output_neurons>
-   bias: False
+Tjoint: !new:speechbrain.nnet.transducer.transducer_joint.Fast_RNNT_Joiner
+   input_dim: !ref <output_neurons>
+   inner_dim: !ref <joint_dim>
+   output_dim: !ref <output_neurons>
 
 log_softmax: !new:speechbrain.nnet.activations.Softmax
    apply_log: True
 
-transducer_cost: !name:speechbrain.nnet.losses.transducer_loss
+transducer_cost: !name:speechbrain.nnet.losses.fast_rnnt_pruned_loss
    blank_index: !ref <blank_index>
-   use_torchaudio: !ref <use_torchaudio>
+   prune_range: 5 # how many symbols to keep for each frame.
+   mode: simple  #simple | smoothed
+   loss_scale: 0.5 #scale for the `mode` loss before adding pruned_loss
+   warmup_epochs: 5 # epochs for the `mode` loss before adding the pruned_loss
+   jointer: !ref <Tjoint>
+   reduction: mean
 
 # This is the RNNLM that is used according to the Huggingface repository
 # NB: It has to match the pre-trained RNNLM!!
-lm_model: !new:speechbrain.lobes.models.RNNLM.RNNLM
-   output_neurons: !ref <output_neurons>
-   embedding_dim: 128
-   activation: !name:torch.nn.LeakyReLU
-   dropout: 0.0
-   rnn_layers: 2
-   rnn_neurons: 2048
-   dnn_blocks: 1
-   dnn_neurons: 512
-   return_hidden: True  # For inference
+# lm_model: !new:speechbrain.lobes.models.RNNLM.RNNLM
+#    output_neurons: !ref <output_neurons>
+#    embedding_dim: 128
+#    activation: !name:torch.nn.LeakyReLU
+#    dropout: 0.0
+#    rnn_layers: 2
+#    rnn_neurons: 2048
+#    dnn_blocks: 1
+#    dnn_neurons: 512
+#    return_hidden: True  # For inference
 
 # for MTL
 # update model if any HEAD module is added
@@ -324,9 +342,8 @@ modules:
    emb: !ref <emb>
    dec: !ref <dec>
    Tjoint: !ref <Tjoint>
-   transducer_lin: !ref <transducer_lin>
    normalize: !ref <normalize>
-   lm_model: !ref <lm_model>
+   # lm_model: !ref <lm_model>
    proj_ctc: !ref <proj_ctc>
    proj_dec: !ref <proj_dec>
    proj_enc: !ref <proj_enc>
@@ -335,30 +352,28 @@ modules:
 # for MTL
 # update model if any HEAD module is added
 model: !new:torch.nn.ModuleList
-   - [!ref <CNN>, !ref <enc>, !ref <emb>, !ref <dec>, !ref <proj_enc>, !ref <proj_dec>, !ref <proj_ctc>, !ref <transducer_lin>]
+   - [!ref <CNN>, !ref <enc>, !ref <emb>, !ref <dec>, !ref <proj_dec>, !ref <proj_enc>, !ref <Tjoint>, !ref <proj_ctc>]
 
 ############################## Decoding & optimiser ############################
 
 # Tokenizer initialization
 tokenizer: !new:sentencepiece.SentencePieceProcessor
 
-Greedysearcher: !new:speechbrain.decoders.transducer.TransducerBeamSearcher
+Greedysearcher: !new:speechbrain.decoders.transducer.FastRNNTBeamSearcher
    decode_network_lst: [!ref <emb>, !ref <dec>, !ref <proj_dec>]
    tjoint: !ref <Tjoint>
-   classifier_network: [!ref <transducer_lin>]
    blank_id: !ref <blank_index>
    beam_size: 1
    nbest: 1
 
-Beamsearcher: !new:speechbrain.decoders.transducer.TransducerBeamSearcher
+Beamsearcher: !new:speechbrain.decoders.transducer.FastRNNTBeamSearcher
    decode_network_lst: [!ref <emb>, !ref <dec>, !ref <proj_dec>]
    tjoint: !ref <Tjoint>
-   classifier_network: [!ref <transducer_lin>]
    blank_id: !ref <blank_index>
    beam_size: !ref <beam_size>
    nbest: !ref <nbest>
-   lm_module: !ref <lm_model>
-   lm_weight: !ref <lm_weight>
+   # lm_module: !ref <lm_model>
+   # lm_weight: !ref <lm_weight>
    state_beam: !ref <state_beam>
    expand_beam: !ref <expand_beam>
 
@@ -367,10 +382,15 @@ opt_class: !name:torch.optim.AdamW
    betas: (0.9, 0.98)
    eps: 1.e-8
    weight_decay: !ref <weight_decay>
+   amsgrad: True
 
-noam_annealing: !new:speechbrain.nnet.schedulers.NoamScheduler
-   lr_initial: !ref <lr>
-   n_warmup_steps: !ref <warmup_steps>
+conformer_warmup: !new:speechbrain.lobes.models.transformer.Conformer.ConformerWarmupScheduler
+   step_count: !ref <warmup_steps>
+
+lr_scheduler: !new:speechbrain.nnet.schedulers.LinearScheduler
+   initial_value: !ref <lr>
+   final_value: !ref <lr_final>
+   epoch_count: !ref <number_of_epochs>
 
 ############################## Logging and Pretrainer ##########################
 
@@ -378,17 +398,17 @@ checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
    checkpoints_dir: !ref <save_folder>
    recoverables:
       model: !ref <model>
-      scheduler: !ref <noam_annealing>
+      # scheduler: !ref <lr_scheduler>
       normalizer: !ref <normalize>
       counter: !ref <epoch_counter>
 
 pretrainer: !new:speechbrain.utils.parameter_transfer.Pretrainer
    collect_in: !ref <save_folder>
    loadables:
-      lm: !ref <lm_model>
+      # lm: !ref <lm_model>
       tokenizer: !ref <tokenizer>
    paths:
-      lm: !ref <pretrained_lm_tokenizer_path>/lm.ckpt
+      # lm: !ref <pretrained_lm_tokenizer_path>/lm.ckpt
       tokenizer: !ref <pretrained_lm_tokenizer_path>/tokenizer.ckpt
 
 
